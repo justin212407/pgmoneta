@@ -48,13 +48,16 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-#define ENV_VAR_CONF_PATH        "PGMONETA_TEST_CONF"
-#define ENV_VAR_CONF_SAMPLE_PATH "PGMONETA_TEST_CONF_SAMPLE"
-#define ENV_VAR_USER_CONF        "PGMONETA_TEST_USER_CONF"
-#define ENV_VAR_RESTORE_DIR      "PGMONETA_TEST_RESTORE_DIR"
-#define ENV_VAR_RETROSPECT_DIR   "PGMONETA_TEST_RETROSPECT_DIR"
-#define ENV_VAR_HOT_STANDBY_DIR  "PGMONETA_TEST_HOT_STANDBY_DIR"
-#define ENV_VAR_EXECUTABLE_DIR   "PGMONETA_TEST_EXECUTABLE_DIR"
+#define ENV_VAR_CONF_PATH              "PGMONETA_TEST_CONF"
+#define ENV_VAR_CONF_SAMPLE_PATH       "PGMONETA_TEST_CONF_SAMPLE"
+#define ENV_VAR_USER_CONF              "PGMONETA_TEST_USER_CONF"
+#define ENV_VAR_RESTORE_DIR            "PGMONETA_TEST_RESTORE_DIR"
+#define ENV_VAR_RETROSPECT_DIR         "PGMONETA_TEST_RETROSPECT_DIR"
+#define ENV_VAR_HOT_STANDBY_DIR        "PGMONETA_TEST_HOT_STANDBY_DIR"
+#define ENV_VAR_EXECUTABLE_DIR         "PGMONETA_TEST_EXECUTABLE_DIR"
+
+#define RESTORED_BACKUP_CONTAINER_NAME "pgmoneta-test-restored-backup"
+#define RESTORED_BACKUP_WAIT_SECONDS   30
 
 char TEST_CONFIG_SAMPLE_PATH[MAX_PATH];
 char TEST_RESTORE_DIR[MAX_PATH];
@@ -87,7 +90,6 @@ pgmoneta_test_environment_create(void)
 
    conf_path = getenv(ENV_VAR_CONF_PATH);
    assert(conf_path != NULL);
-   // Create the shared memory for the configuration
    size = sizeof(struct main_configuration);
    ret = pgmoneta_create_shared_memory(size, HUGEPAGE_OFF, &shmem);
    assert(!ret);
@@ -95,17 +97,14 @@ pgmoneta_test_environment_create(void)
    ret = pgmoneta_init_main_configuration(shmem);
    assert(!ret);
 
-   // Try reading configuration from the configuration path
    ret = pgmoneta_read_main_configuration(shmem, conf_path);
    assert(!ret);
 
-   // Validate the configuration is valid
    ret = pgmoneta_test_validate_configuration(shmem);
    assert(!ret);
 
    config = (struct main_configuration*)shmem;
 
-   // some validations just to be safe
    memcpy(&config->common.configuration_path[0], conf_path, MIN(strlen(conf_path), MAX_PATH - 1));
    assert(config->common.number_of_servers > 0);
    assert(pgmoneta_compare_string(config->common.servers[0].name, "primary"));
@@ -135,7 +134,6 @@ pgmoneta_test_environment_create(void)
 
    pgmoneta_start_logging();
 
-   // Try reading the users configuration path
    ret = pgmoneta_read_users_configuration(shmem, user_conf_path);
    assert(!ret);
 }
@@ -166,14 +164,12 @@ pgmoneta_test_validate_configuration(void* shmem)
       return 1;
    }
 
-   // Use the existing validation function for comprehensive checks
    return pgmoneta_validate_main_configuration(shmem);
 }
 
 int
 pgmoneta_test_add_backup(void)
 {
-   /* Ensure server is online before backup */
    if (pgmoneta_tsclient_mode("primary", "online", 0))
    {
       return 1;
@@ -189,7 +185,6 @@ pgmoneta_test_add_backup(void)
 int
 pgmoneta_test_add_backup_chain(void)
 {
-   /* Ensure server is online before backup */
    if (pgmoneta_tsclient_mode("primary", "online", 0))
    {
       return 1;
@@ -220,7 +215,6 @@ pgmoneta_test_basedir_cleanup(void)
    char* wal_dir = NULL;
    bool restart = false;
    struct main_configuration* config;
-   int ret = 0;
 
    config = (struct main_configuration*)shmem;
 
@@ -321,7 +315,6 @@ pgmoneta_test_config_restore(void)
 int
 pgmoneta_test_backup(const char* server_name, const char* backup_name)
 {
-   /* Cast const away as pgmoneta_tsclient_backup doesn't modify the strings */
    return pgmoneta_tsclient_backup((char*)server_name, (char*)backup_name, 0);
 }
 
@@ -331,7 +324,6 @@ pgmoneta_test_execute_query(int srv, SSL* ssl, int skt, char* query, struct quer
    struct message* msg = NULL;
    struct query_response* response = NULL;
 
-   /* create and execute the query */
    pgmoneta_create_query_message(query, &msg);
    if (pgmoneta_query_execute(ssl, skt, msg, &response) || response == NULL)
    {
@@ -378,20 +370,19 @@ pgmoneta_test_resolve_binary_path(const char* binary_name, char* out)
    }
    self[len] = '\0';
 
-   /* Fallback when check.sh env vars are unavailable: derive .../build from .../build/test/pgmoneta-test */
    slash = strrchr(self, '/');
    if (slash == NULL)
    {
       return 1;
    }
-   *slash = '\0'; /* .../build/test */
+   *slash = '\0';
 
    slash = strrchr(self, '/');
    if (slash == NULL)
    {
       return 1;
    }
-   *slash = '\0'; /* .../build */
+   *slash = '\0';
 
    pgmoneta_snprintf(out, MAX_PATH, "%s/src/%s", self, binary_name);
 
@@ -527,9 +518,7 @@ pgmoneta_test_setup_encryption_env(struct test_encryption_env* env)
    {
       return 1;
    }
-   /* Base64 encoded "pgmoneta-test-password" */
    fprintf(f, "cGdtb25ldGEtdGVzdC1wYXNzd29yZA==\n");
-   /* Base64 encoded 16-byte zero salt */
    fprintf(f, "AAAAAAAAAAAAAAAAAAAAAA==\n");
    fclose(f);
    chmod(master_key_file, 0600);
@@ -582,4 +571,212 @@ pgmoneta_test_teardown_encryption_env(struct test_encryption_env* env)
    }
 
    pgmoneta_clear_aes_cache();
+}
+
+static int
+ensure_restore_subdir(const char* restore_dir, const char* subdir)
+{
+   char path[MAX_PATH];
+
+   if (restore_dir == NULL || subdir == NULL)
+   {
+      return 1;
+   }
+
+   if (pgmoneta_snprintf(path, sizeof(path), "%s/%s", restore_dir, subdir) <= 0)
+   {
+      return 1;
+   }
+
+   return pgmoneta_mkdir(path);
+}
+
+static int
+write_restore_pg_hba(const char* restore_dir)
+{
+   char path[MAX_PATH];
+   FILE* f = NULL;
+
+   if (restore_dir == NULL)
+   {
+      return 1;
+   }
+
+   if (pgmoneta_snprintf(path, sizeof(path), "%s/pg_hba.conf", restore_dir) <= 0)
+   {
+      return 1;
+   }
+
+   f = fopen(path, "w");
+   if (f == NULL)
+   {
+      return 1;
+   }
+
+   fprintf(f, "local all all trust\n");
+   fprintf(f, "host all all 127.0.0.1/32 trust\n");
+   fprintf(f, "host all all ::1/128 trust\n");
+   fprintf(f, "host all all 0.0.0.0/0 trust\n");
+   fprintf(f, "host all all ::/0 trust\n");
+
+   fclose(f);
+   return 0;
+}
+
+int
+start_restored_backup(const char* restore_dir, int port)
+{
+   const char* subdirs[] = {
+      "pg_wal",
+      "pg_xact",
+      "pg_subtrans",
+      "pg_multixact",
+      "pg_multixact/members",
+      "pg_multixact/offsets",
+      "pg_serial",
+      "pg_snapshots",
+      "pg_stat",
+      "pg_stat_tmp",
+      "pg_tblspc",
+      "pg_twophase",
+      "pg_replslot",
+      "pg_commit_ts",
+      "pg_dynshmem",
+      "pg_notify",
+      "pg_logical",
+      "pg_logical/snapshots",
+      "pg_logical/mappings"};
+   const size_t subdir_count = sizeof(subdirs) / sizeof(subdirs[0]);
+   char image[MAX_PATH];
+   char command[2048];
+   char* output = NULL;
+   int exit_code = 0;
+   const char* version_env = NULL;
+   const char* version = NULL;
+   char recovery_path[MAX_PATH];
+   char standby_path[MAX_PATH];
+   size_t i;
+
+   if (restore_dir == NULL || restore_dir[0] == '\0')
+   {
+      return -1;
+   }
+
+   if (port <= 0)
+   {
+      port = RESTORED_BACKUP_DEFAULT_PORT;
+   }
+
+   stop_restored_backup();
+
+   for (i = 0; i < subdir_count; i++)
+   {
+      if (ensure_restore_subdir(restore_dir, subdirs[i]))
+      {
+         return -1;
+      }
+   }
+
+   if (write_restore_pg_hba(restore_dir))
+   {
+      return -1;
+   }
+
+   if (pgmoneta_snprintf(recovery_path, sizeof(recovery_path), "%s/recovery.signal", restore_dir) <= 0 ||
+       pgmoneta_snprintf(standby_path, sizeof(standby_path), "%s/standby.signal", restore_dir) <= 0)
+   {
+      return -1;
+   }
+
+   {
+      const char* recovery_env = getenv("PGMONETA_TEST_RECOVERY_SIGNAL");
+
+      if (recovery_env != NULL && strcmp(recovery_env, "1") == 0)
+      {
+         if (!pgmoneta_exists(recovery_path))
+         {
+            FILE* rf = fopen(recovery_path, "a");
+            if (rf == NULL)
+            {
+               return -1;
+            }
+            fclose(rf);
+         }
+      }
+      else if (recovery_env != NULL && strcmp(recovery_env, "0") == 0)
+      {
+         if (pgmoneta_exists(recovery_path))
+         {
+            pgmoneta_delete_file(recovery_path, NULL);
+         }
+         if (pgmoneta_exists(standby_path))
+         {
+            pgmoneta_delete_file(standby_path, NULL);
+         }
+      }
+   }
+
+   /* TODO: Tablespace support needs additional volume mounts for pg_tblspc targets. */
+
+   version_env = getenv("TEST_PG_VERSION");
+   version = (version_env != NULL && version_env[0] != '\0') ? version_env : "17";
+
+   if (pgmoneta_snprintf(image, sizeof(image), "pgmoneta-test-postgresql%s-rocky10", version) <= 0)
+   {
+      return -1;
+   }
+
+   if (pgmoneta_snprintf(command, sizeof(command),
+                         "podman run -d --name %s -p %d:5432 -v \"%s:/pgdata:Z\" "
+                         "-e PGDATA=/pgdata -e POSTGRES_HOST_AUTH_METHOD=trust %s "
+                         "/usr/pgsql-%s/bin/postgres -D /pgdata -c listen_addresses='*'",
+                         RESTORED_BACKUP_CONTAINER_NAME, port, restore_dir, image, version) <= 0)
+   {
+      return -1;
+   }
+
+   if (pgmoneta_test_exec_command(command, &output, &exit_code) || exit_code != 0)
+   {
+      free(output);
+      return -1;
+   }
+   free(output);
+   output = NULL;
+
+   {
+      int i2;
+      for (i2 = 0; i2 < RESTORED_BACKUP_WAIT_SECONDS; i2++)
+      {
+         if (pgmoneta_snprintf(command, sizeof(command),
+                               "podman exec %s /usr/pgsql-%s/bin/pg_isready -h localhost -p 5432",
+                               RESTORED_BACKUP_CONTAINER_NAME, version) <= 0)
+         {
+            break;
+         }
+
+         if (pgmoneta_test_exec_command(command, &output, &exit_code) == 0 && exit_code == 0)
+         {
+            free(output);
+            return port;
+         }
+
+         free(output);
+         output = NULL;
+         sleep(1);
+      }
+   }
+
+   free(output);
+   stop_restored_backup();
+   return -1;
+}
+
+void
+stop_restored_backup(void)
+{
+   char* output = NULL;
+   int exit_code = 0;
+
+   pgmoneta_test_exec_command("podman rm -f " RESTORED_BACKUP_CONTAINER_NAME, &output, &exit_code);
+   free(output);
 }
